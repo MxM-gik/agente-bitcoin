@@ -1,1 +1,1 @@
-worker: python agente_server.py
+web: python agente_server.py

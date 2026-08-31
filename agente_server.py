@@ -2,10 +2,11 @@ import ccxt
 import time
 import threading
 from datetime import datetime, timedelta
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 
 # ============================================
-# AGENTE MULTI-MERCADO — MODO SERVIDOR
-# Sin interfaz gráfica — solo trading + Telegram
+# AGENTE MULTI-MERCADO — MODO SERVIDOR + API
 # ============================================
 
 CAPITAL_INICIAL = 15000
@@ -28,9 +29,9 @@ STOP_LOSS_CATASTROFICO = 0.18
 CAIDA_REACTIVA         = 0.02
 
 MERCADOS_CONFIG = [
-    {"simbolo": "BTC/USDT", "nombre": "Bitcoin",  "icono": "₿"},
-    {"simbolo": "ETH/USDT", "nombre": "Ethereum", "icono": "Ξ"},
-    {"simbolo": "BNB/USDT", "nombre": "BNB",      "icono": "◈"},
+    {"simbolo": "BTC/USDT", "nombre": "Bitcoin",  "icono": "₿", "color": "#ff9500"},
+    {"simbolo": "ETH/USDT", "nombre": "Ethereum", "icono": "Ξ", "color": "#00cfff"},
+    {"simbolo": "BNB/USDT", "nombre": "BNB",      "icono": "◈", "color": "#ffe600"},
 ]
 
 CAPITAL_POR_MERCADO = {
@@ -58,6 +59,7 @@ class MercadoState:
         self.simbolo   = cfg["simbolo"]
         self.nombre    = cfg["nombre"]
         self.icono     = cfg["icono"]
+        self.color     = cfg["color"]
         cap = CAPITAL_POR_MERCADO[self.simbolo]
         self.capital_disponible  = cap
         self.capital_inicial     = cap
@@ -66,17 +68,23 @@ class MercadoState:
         self.capital_recuperado  = False
         self.posiciones          = []
         self.precio_base         = 0
+        self.precio_actual       = 0
         self.historial_precios   = []
         self.buffer_lecturas     = []
+        self.log_lecturas        = []
+        self.log_transacciones   = []
         self.pausado_hasta       = None
         self.precio_ultima_venta = 0
         self.compras_consecutivas= 0
+        self.precio_max_dia      = 0
+        self.precio_min_dia      = 0
         self.ultimo_ciclo_ts     = None
         self.loop_running        = False
 
 estados = [MercadoState(cfg) for cfg in MERCADOS_CONFIG]
 agente_activo = True
 
+# ── HELPERS ──
 def clp_a_usd(clp): return clp / CLP_POR_USD
 def usd_a_clp(usd): return usd * CLP_POR_USD
 def btc_total(e):   return sum(p['btc'] for p in e.posiciones)
@@ -89,24 +97,10 @@ def ganancia_pct(e, precio):
     return (valor_pos_clp(e, precio) - total_inv) / total_inv
 
 def log(e, msg):
-    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    ts = datetime.now().strftime('%H:%M:%S')
+    e.log_lecturas.insert(0, f"[{ts}] {msg}")
+    if len(e.log_lecturas) > 200: e.log_lecturas.pop()
     print(f"[{ts}][{e.nombre}] {msg}", flush=True)
-
-def simular_compra(e, precio, porcentaje_capital, motivo):
-    if e.capital_disponible <= 0: return
-    monto_clp    = e.capital_disponible * porcentaje_capital
-    monto_usd    = clp_a_usd(monto_clp)
-    activo_comp  = (monto_usd * (1 - COMISION)) / precio
-    e.capital_disponible -= monto_clp
-    e.posiciones.append({
-        'btc': activo_comp,
-        'precio_compra': precio,
-        'capital_invertido_clp': monto_clp,
-        'ciclos': 0
-    })
-    e.compras_consecutivas += 1
-    log(e, f"COMPRA {motivo} | ${precio:,.2f} USD | ${monto_clp:,.0f} CLP")
-    telegram(f"{e.icono} <b>COMPRA — {e.nombre}</b>\n💵 ${precio:,.2f} USD\n💰 ${monto_clp:,.0f} CLP\n📌 {motivo}")
 
 def puede_vender(e, precio, porcentaje):
     total_inv    = sum(p['capital_invertido_clp'] for p in e.posiciones)
@@ -118,9 +112,28 @@ def puede_vender(e, precio, porcentaje):
     neto_clp = usd_a_clp(btc_v * precio * (1 - COMISION))
     ganancia = neto_clp - inv_a_vender
     if ganancia < 20:
-        log(e, f"VENTA BLOQUEADA — ganancia insuficiente (${ganancia:,.0f} CLP < $20)")
+        log(e, f"VENTA BLOQUEADA — ganancia insuficiente (${ganancia:,.0f} CLP)")
         return False
     return True
+
+def simular_compra(e, precio, porcentaje_capital, motivo):
+    if e.capital_disponible <= 0: return
+    monto_clp   = e.capital_disponible * porcentaje_capital
+    monto_usd   = clp_a_usd(monto_clp)
+    activo_comp = (monto_usd * (1 - COMISION)) / precio
+    e.capital_disponible -= monto_clp
+    e.posiciones.append({
+        'btc': activo_comp,
+        'precio_compra': precio,
+        'capital_invertido_clp': monto_clp,
+        'ciclos': 0
+    })
+    e.compras_consecutivas += 1
+    ts = datetime.now().strftime('%H:%M:%S')
+    e.log_transacciones.insert(0, f"[{ts}] COMPRA {motivo} | ${precio:,.2f} | ${monto_clp:,.0f} CLP")
+    if len(e.log_transacciones) > 100: e.log_transacciones.pop()
+    log(e, f"COMPRA {motivo} | ${precio:,.2f} USD | ${monto_clp:,.0f} CLP")
+    telegram(f"{e.icono} <b>COMPRA — {e.nombre}</b>\n💵 ${precio:,.2f} USD\n💰 ${monto_clp:,.0f} CLP\n📌 {motivo}")
 
 def simular_venta_parcial(e, precio, porcentaje, motivo, actualizar_base=False):
     if not e.posiciones: return
@@ -140,7 +153,10 @@ def simular_venta_parcial(e, precio, porcentaje, motivo, actualizar_base=False):
         e.capital_recuperado = True
         log(e, "*** CAPITAL RECUPERADO — FASE 2 ***")
     signo = "+" if ganancia >= 0 else ""
-    log(e, f"VENTA {motivo} | ${precio:,.2f} USD | {porcentaje*100:.0f}% | {signo}${ganancia:,.0f} CLP")
+    ts = datetime.now().strftime('%H:%M:%S')
+    e.log_transacciones.insert(0, f"[{ts}] VENTA {motivo} | ${precio:,.2f} | {signo}${ganancia:,.0f} CLP")
+    if len(e.log_transacciones) > 100: e.log_transacciones.pop()
+    log(e, f"VENTA {motivo} | ${precio:,.2f} | {porcentaje*100:.0f}% | {signo}${ganancia:,.0f} CLP")
     emoji = "💰" if ganancia > 0 else "🔴"
     telegram(f"{emoji} <b>VENTA — {e.nombre}</b>\n💵 ${precio:,.2f} USD\n{signo}${ganancia:,.0f} CLP\n📌 {motivo}")
     e.compras_consecutivas = 0
@@ -158,6 +174,7 @@ def obtener_precio(e):
             if intento < 2: time.sleep(10)
     raise Exception(f"{e.nombre}: sin respuesta")
 
+# ── LOOP POR MERCADO ──
 def loop_mercado(e):
     e.loop_running = True
     capital_inicio_dia = e.capital_disponible
@@ -168,6 +185,7 @@ def loop_mercado(e):
         try:
             if e.pausado_hasta and datetime.now() < e.pausado_hasta:
                 precio = obtener_precio(e)
+                e.precio_actual = precio
                 e.historial_precios.append(precio)
                 if len(e.historial_precios) > 60: e.historial_precios.pop(0)
                 if e.precio_ultima_venta > 0:
@@ -181,7 +199,6 @@ def loop_mercado(e):
                 log(e, f"En pausa hasta {e.pausado_hasta.strftime('%d/%m %H:%M')} | ${precio:,.2f}")
                 time.sleep(300)
                 continue
-
             elif e.pausado_hasta and datetime.now() >= e.pausado_hasta:
                 e.pausado_hasta   = None
                 e.precio_base     = 0
@@ -191,10 +208,14 @@ def loop_mercado(e):
                 log(e, "Pausa terminada — reiniciando")
 
             precio = obtener_precio(e)
+            e.precio_actual   = precio
             e.ultimo_ciclo_ts = datetime.now()
             precio_anterior   = e.historial_precios[-1] if e.historial_precios else precio
             e.historial_precios.append(precio)
             if len(e.historial_precios) > 60: e.historial_precios.pop(0)
+
+            if precio > e.precio_max_dia or e.precio_max_dia == 0: e.precio_max_dia = precio
+            if precio < e.precio_min_dia or e.precio_min_dia == 0: e.precio_min_dia = precio
 
             if e.precio_base == 0:
                 e.precio_base = precio
@@ -230,7 +251,7 @@ def loop_mercado(e):
                     if puede_vender(e, precio, 0.50):
                         simular_venta_parcial(e, precio, 0.50, f"Pico +{g*100:.2f}% >=0.5%")
                 elif precio_bajando:
-                    log(e, f"PRECIO BAJA — ganancia insuficiente {g*100:.3f}% — manteniendo")
+                    log(e, f"PRECIO BAJA — ganancia {g*100:.3f}% insuficiente — manteniendo")
                 else:
                     log(e, f"MANTENIENDO {g*100:.3f}% | ${precio:,.2f}")
 
@@ -249,9 +270,8 @@ def loop_mercado(e):
                 elif not precio_subiendo and caida >= CAIDA_LEVE:
                     log(e, f"SIGUE BAJANDO {caida*100:.3f}% — esperando rebote")
                 elif not e.posiciones:
-                    log(e, f"ESPERANDO | caída {caida*100:.3f}% insuficiente | base ${e.precio_base:,.2f}")
+                    log(e, f"ESPERANDO | caída {caida*100:.3f}% | base ${e.precio_base:,.2f}")
 
-            # Stop loss diario
             cap_total   = e.capital_disponible + valor_pos_clp(e, precio)
             perdida_dia = (capital_inicio_dia - cap_total) / capital_inicio_dia if capital_inicio_dia > 0 else 0
             if perdida_dia >= STOP_LOSS_DIARIO:
@@ -262,7 +282,7 @@ def loop_mercado(e):
             time.sleep(300)
 
         except Exception as ex:
-            log(e, f"Error — reintentando en 30s ({str(ex)[:50]})")
+            log(e, f"Error — reintentando ({str(ex)[:50]})")
             time.sleep(30)
 
     e.loop_running = False
@@ -275,14 +295,146 @@ def watchdog():
             if e.ultimo_ciclo_ts:
                 mins = (datetime.now() - e.ultimo_ciclo_ts).seconds / 60
                 if mins > 10 and not e.loop_running:
-                    log(e, f"WATCHDOG — {mins:.0f} min sin lectura. Reiniciando...")
-                    telegram(f"⚠️ <b>{e.nombre}</b> — reiniciando hilo")
+                    log(e, f"WATCHDOG — reiniciando hilo")
+                    telegram(f"⚠️ <b>{e.nombre}</b> — reiniciando")
                     hilo = threading.Thread(target=loop_mercado, args=(e,), daemon=True)
                     hilo.start()
 
 
+# ============================================
+# API FLASK
+# ============================================
+
+app = Flask(__name__)
+CORS(app)
+
+def estado_json(e):
+    precio = e.precio_actual
+    cap_total = e.capital_disponible + valor_pos_clp(e, precio) if precio > 0 else e.capital_disponible
+    en_inversion = valor_pos_clp(e, precio) if precio > 0 else 0
+    g_pos = ganancia_pct(e, precio) * 100 if e.posiciones and precio > 0 else 0
+    caida = max(0, (e.precio_base - precio) / e.precio_base * 100) if e.precio_base > 0 and precio > 0 else 0
+
+    proxima = ""
+    if e.pausado_hasta and datetime.now() < e.pausado_hasta:
+        proxima = f"En pausa hasta {e.pausado_hasta.strftime('%H:%M')} — vigilando caída 2%"
+    elif e.precio_base == 0:
+        proxima = "Estableciendo precio base..."
+    elif e.posiciones:
+        p15 = e.precio_base * (1 + SALIDA_MEDIA)
+        p30 = e.precio_base * (1 + SALIDA_FUERTE)
+        proxima = f"Vende 1.5% → ${p15:,.0f} | 3% → ${p30:,.0f} | Ahora: {g_pos:+.2f}%"
+    else:
+        p1 = e.precio_base * (1 - CAIDA_LEVE)
+        p3 = e.precio_base * (1 - CAIDA_MEDIA)
+        proxima = f"Compra 30% si baja a ${p1:,.0f} | 60% si baja a ${p3:,.0f}"
+
+    seg_prox = 0
+    if e.ultimo_ciclo_ts:
+        seg_prox = max(0, 300 - (datetime.now() - e.ultimo_ciclo_ts).seconds)
+
+    return {
+        "simbolo":          e.simbolo,
+        "nombre":           e.nombre,
+        "icono":            e.icono,
+        "color":            e.color,
+        "precio":           precio,
+        "precio_base":      e.precio_base,
+        "caida":            round(caida, 3),
+        "ganancia_pos":     round(g_pos, 3),
+        "capital_libre":    round(e.capital_disponible),
+        "en_inversion":     round(en_inversion),
+        "capital_total":    round(cap_total),
+        "ganancia_total":   round(e.ganancia_total),
+        "operaciones":      e.operaciones,
+        "posiciones":       len(e.posiciones),
+        "fase":             2 if e.capital_recuperado else 1,
+        "precio_max":       e.precio_max_dia,
+        "precio_min":       e.precio_min_dia,
+        "pausado":          bool(e.pausado_hasta and datetime.now() < e.pausado_hasta),
+        "proxima_accion":   proxima,
+        "seg_prox_ciclo":   seg_prox,
+        "historial":        e.historial_precios[-30:],
+    }
+
+@app.route("/api/status")
+def api_status():
+    total = sum(
+        e.capital_disponible + valor_pos_clp(e, e.precio_actual)
+        for e in estados if e.precio_actual > 0
+    )
+    gan_total = sum(e.ganancia_total for e in estados)
+    return jsonify({
+        "mercados":       [estado_json(e) for e in estados],
+        "capital_total":  round(total),
+        "ganancia_total": round(gan_total),
+        "timestamp":      datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+    })
+
+@app.route("/api/logs/<simbolo_key>")
+def api_logs(simbolo_key):
+    for e in estados:
+        if e.nombre.lower() == simbolo_key.lower() or e.simbolo.replace("/","") == simbolo_key.upper():
+            return jsonify({"logs": e.log_lecturas[:50]})
+    return jsonify({"error": "mercado no encontrado"}), 404
+
+@app.route("/api/transacciones/<simbolo_key>")
+def api_transacciones(simbolo_key):
+    for e in estados:
+        if e.nombre.lower() == simbolo_key.lower() or e.simbolo.replace("/","") == simbolo_key.upper():
+            return jsonify({"transacciones": e.log_transacciones[:30]})
+    return jsonify({"error": "mercado no encontrado"}), 404
+
+@app.route("/api/comprar", methods=["POST"])
+def api_comprar():
+    data = request.json
+    nombre = data.get("mercado", "")
+    pct    = float(data.get("porcentaje", 0.30))
+    for e in estados:
+        if e.nombre.lower() == nombre.lower():
+            if e.precio_actual == 0:
+                return jsonify({"error": "Sin precio base aún"}), 400
+            if e.capital_disponible <= 0:
+                return jsonify({"error": "Sin capital disponible"}), 400
+            simular_compra(e, e.precio_actual, pct, f"MANUAL {pct*100:.0f}%")
+            return jsonify({"ok": True})
+    return jsonify({"error": "mercado no encontrado"}), 404
+
+@app.route("/api/vender", methods=["POST"])
+def api_vender():
+    data = request.json
+    nombre = data.get("mercado", "")
+    pct    = float(data.get("porcentaje", 0.50))
+    for e in estados:
+        if e.nombre.lower() == nombre.lower():
+            if not e.posiciones:
+                return jsonify({"error": "Sin posición activa"}), 400
+            simular_venta_parcial(e, e.precio_actual, pct, f"MANUAL {pct*100:.0f}%")
+            return jsonify({"ok": True})
+    return jsonify({"error": "mercado no encontrado"}), 404
+
+@app.route("/api/reset_base", methods=["POST"])
+def api_reset_base():
+    data   = request.json
+    nombre = data.get("mercado", "")
+    for e in estados:
+        if e.nombre.lower() == nombre.lower():
+            e.precio_base = e.precio_actual
+            log(e, f"BASE ACTUALIZADA MANUAL: ${e.precio_base:,.2f}")
+            return jsonify({"ok": True})
+    return jsonify({"error": "mercado no encontrado"}), 404
+
+@app.route("/")
+def index():
+    return "Agente Multi-Mercado API — OK"
+
+
+# ============================================
+# MAIN
+# ============================================
+
 if __name__ == "__main__":
-    print("=== AGENTE MULTI-MERCADO — MODO SERVIDOR ===", flush=True)
+    print("=== AGENTE MULTI-MERCADO SERVIDOR ===", flush=True)
     telegram("🚀 <b>AGENTE SERVIDOR INICIADO</b>\nBTC + ETH + BNB activos")
 
     for e in estados:
@@ -293,6 +445,4 @@ if __name__ == "__main__":
     hilo_wd = threading.Thread(target=watchdog, daemon=True)
     hilo_wd.start()
 
-    # Mantener proceso vivo
-    while True:
-        time.sleep(60)
+    app.run(host="0.0.0.0", port=8080)
