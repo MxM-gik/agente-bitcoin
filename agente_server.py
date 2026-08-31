@@ -2,8 +2,9 @@ import ccxt
 import time
 import threading
 from datetime import datetime, timedelta
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
+import os
 
 # ============================================
 # AGENTE MULTI-MERCADO — MODO SERVIDOR + API
@@ -426,7 +427,7 @@ def api_reset_base():
 
 @app.route("/")
 def index():
-    return "Agente Multi-Mercado API — OK"
+    return send_from_directory(os.path.dirname(os.path.abspath(__file__)), "index.html")
 
 
 # ============================================
